@@ -1,10 +1,10 @@
-name: "دانلودر لینک مستقیم"
+name: "Pixeldrain Downloader"
 
 on:
   workflow_dispatch:
     inputs:
-      file_url:
-        description: "Direct File URL"
+      pixeldrain_url:
+        description: "Pixeldrain URL (e.g., https://pixeldrain.com/u/SLZs3jWo)"
         required: true
         type: string
 
@@ -38,24 +38,56 @@ on:
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
-  direct-download:
+  pixeldrain-download:
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y p7zip-full curl
+          sudo apt-get install -y p7zip-full curl jq
+
+      - name: Get Download Info
+        id: info
+        shell: bash
+        run: |
+          PIXELDRAIN_URL="${{ github.event.inputs.pixeldrain_url }}"
+
+          # Extract ID from URL
+          if [[ $PIXELDRAIN_URL =~ pixeldrain\.com/u/([a-zA-Z0-9]+) ]]; then
+            FILE_ID="${BASH_REMATCH[1]}"
+          else
+            echo "Invalid Pixeldrain URL format"
+            exit 1
+          fi
+
+          # Get file info from API
+          API_URL="https://pixeldrain.com/api/file/${FILE_ID}/info"
+          INFO=$(curl -s "$API_URL")
+
+          if [[ $(echo "$INFO" | jq -r '.success') != "true" ]]; then
+            echo "Failed to get file info"
+            exit 1
+          fi
+
+          FILENAME=$(echo "$INFO" | jq -r '.name')
+          FILESIZE=$(echo "$INFO" | jq -r '.size')
+
+          # Sanitize filename
+          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+
+          DOWNLOAD_URL="https://pixeldrain.com/api/file/${FILE_ID}"
+
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+          echo "filesize=$FILESIZE" >> "$GITHUB_OUTPUT"
 
       - name: Download File
         id: download
@@ -63,18 +95,15 @@ jobs:
         run: |
           mkdir -p temp_dl
 
-          FILE_URL="${{ github.event.inputs.file_url }}"
-
-          FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
-          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+          DOWNLOAD_URL="${{ steps.info.outputs.download_url }}"
+          FILENAME="${{ steps.info.outputs.filename }}"
 
           echo "Downloading: $FILENAME"
 
           curl -L --fail --retry 3 \
             -o "temp_dl/$FILENAME" \
-            "$FILE_URL"
+            "$DOWNLOAD_URL"
 
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
           echo "filepath=temp_dl/$FILENAME" >> "$GITHUB_OUTPUT"
 
       - name: Create Split Archive
@@ -105,6 +134,11 @@ jobs:
             mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
           fi
 
+          # Remove the original downloaded file to avoid committing large raw downloads.
+          if [ -f "$BASENAME" ]; then
+            rm -f "$BASENAME"
+          fi
+
           echo "archive_name=${ARCHIVE_BASE}.7z" >> "$GITHUB_OUTPUT"
 
           cd ..
@@ -124,11 +158,11 @@ jobs:
 
           mkdir -p downloads
 
-          mv temp_dl/* downloads/ 2>/dev/null || true
+          mv temp_dl/*.7z* downloads/ 2>/dev/null || true
 
           git add downloads/
 
-          git commit -m "Direct Download: ${{ steps.download.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+          git commit -m "Pixeldrain Download: ${{ steps.info.outputs.filename }} [skip ci]" || echo "Nothing to commit"
 
           git push
 
@@ -136,14 +170,15 @@ jobs:
         if: github.event.inputs.upload_method == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('direct-{0}', github.run_number) }}
-          name: Direct Download Release
+          tag_name: ${{ github.event.inputs.release_tag || format('pixeldrain-{0}', github.run_number) }}
+          name: Pixeldrain Download Release
           body: |
-            Direct download completed.
+            Pixeldrain download completed.
 
-            File: ${{ steps.download.outputs.filename }}
+            File: ${{ steps.info.outputs.filename }}
+            Size: ${{ steps.info.outputs.filesize }} bytes
             Date: ${{ steps.get_date.outputs.date }}
-          files: temp_dl/*
+          files: temp_dl/*.7z*
 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

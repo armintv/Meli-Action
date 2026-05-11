@@ -1,17 +1,32 @@
-name: تلگرام دانلودر
+name: telegram downloader
 
 on:
   workflow_dispatch:
     inputs:
-      telegram_link:
-        description: '🔗 Telegram post link (e.g., https://t.me/channel/123)'
+      telegram_links:
+        description: '🔗 لینک‌های تلگرام (حداکثر 1000 عدد، جدا با کاما، فاصله یا خط جدید)'
         required: true
         type: string
       split_threshold_mb:
-        description: '📦 Maximum file size per part (MB) – set 0 to disable splitting'
+        description: '📦 حداکثر حجم هر قطعه (MB) – 0 = بدون تقسیم'
         required: false
         type: number
         default: 90
+      subfolder:
+        description: '📁 زیرپوشهٔ دلخواه در downloads (اختیاری؛ خالی = مستقیم داخل downloads)'
+        required: false
+        type: string
+        default: ''
+      custom_filename:
+        description: '✏️ نام فایل دلخواه (فقط وقتی یک فایل دانلود شود؛ پسوند اصلی حفظ می‌شود)'
+        required: false
+        type: string
+        default: ''
+      clean_previous:
+        description: '🗑️ پاک‌سازی همهٔ فایل‌های downloads قبل از دانلود (پیشنهاد می‌شود تیک خورده باشد)'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -23,225 +38,469 @@ jobs:
       contents: write
 
     steps:
-      - name: 📂 Clone repository
+      # ──────────────────────────────────────
+      # قدم اول: حذف پوشه downloads (در صورت وجود)
+      # ──────────────────────────────────────
+      - name: 🗑️ حذف پوشهٔ downloads (در صورت وجود)
+        if: github.event.inputs.clean_previous == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          API="https://api.github.com/repos/${REPO}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          ACCEPT="Accept: application/vnd.github+json"
+
+          echo "📡 دریافت آخرین commit..."
+          COMMIT_SHA=$(curl -s -H "$AUTH" -H "$ACCEPT" "$API/git/ref/heads/${BRANCH}" | jq -r '.object.sha')
+          if [ -z "$COMMIT_SHA" ] || [ "$COMMIT_SHA" = "null" ]; then
+            echo "❌ شاخه یافت نشد."; exit 1
+          fi
+          echo "   Commit: $COMMIT_SHA"
+
+          echo "📡 دریافت SHA درخت فعلی..."
+          TREE_SHA=$(curl -s -H "$AUTH" -H "$ACCEPT" "$API/git/commits/$COMMIT_SHA" | jq -r '.tree.sha')
+          echo "   Tree: $TREE_SHA"
+
+          echo "📡 بررسی وجود پوشهٔ downloads در درخت..."
+          TREE_CONTENT=$(curl -s -H "$AUTH" -H "$ACCEPT" "$API/git/trees/$TREE_SHA?recursive=1")
+          HAS_DOWNLOADS=$(echo "$TREE_CONTENT" | jq '[.tree[]? | select(.path | startswith("downloads/"))] | length')
+
+          if [ "$HAS_DOWNLOADS" -eq 0 ]; then
+            echo "📂 پوشهٔ downloads وجود ندارد – نیازی به حذف نیست."
+            exit 0
+          fi
+
+          echo "🔍 پوشهٔ downloads پیدا شد – در حال حذف..."
+          echo "📝 ایجاد درخت جدید (فقط با حذف downloads)..."
+          NEW_TREE_SHA=$(curl -s -X POST -H "$AUTH" -H "$ACCEPT" \
+            -d "{\"base_tree\":\"${TREE_SHA}\",\"tree\":[{\"path\":\"downloads\",\"mode\":\"040000\",\"type\":\"tree\",\"sha\":null}]}" \
+            "$API/git/trees" | jq -r '.sha')
+          if [ -z "$NEW_TREE_SHA" ] || [ "$NEW_TREE_SHA" = "null" ]; then
+            echo "❌ ساخت درخت جدید ناموفق."; exit 1
+          fi
+          echo "   New Tree: $NEW_TREE_SHA"
+
+          echo "📝 ایجاد commit حذف..."
+          NEW_COMMIT_SHA=$(curl -s -X POST -H "$AUTH" -H "$ACCEPT" \
+            -d "{\"message\":\"حذف پوشه downloads\",\"tree\":\"${NEW_TREE_SHA}\",\"parents\":[\"${COMMIT_SHA}\"]}" \
+            "$API/git/commits" | jq -r '.sha')
+          if [ -z "$NEW_COMMIT_SHA" ] || [ "$NEW_COMMIT_SHA" = "null" ]; then
+            echo "❌ ایجاد commit ناموفق."; exit 1
+          fi
+          echo "   New Commit: $NEW_COMMIT_SHA"
+
+          echo "🔄 به‌روزرسانی شاخه..."
+          PATCH_RESULT=$(curl -s -X PATCH -H "$AUTH" -H "$ACCEPT" \
+            -d "{\"sha\":\"${NEW_COMMIT_SHA}\",\"force\":false}" \
+            "$API/git/refs/heads/${BRANCH}")
+          if echo "$PATCH_RESULT" | jq -e '.ref' > /dev/null; then
+            echo "✅ پوشهٔ downloads و تمام فایل‌هایش یکجا حذف شدند."
+          else
+            echo "❌ آپدیت شاخه ناموفق:"
+            echo "$PATCH_RESULT"
+            exit 1
+          fi
+
+      # ──────────────────────────────────────
+      # قدم دوم: دریافت شاخه (حالا سبک)
+      # ──────────────────────────────────────
+      - name: 📂 دریافت مخزن (فقط آخرین نسخه)
         uses: actions/checkout@v5
         with:
+          ref: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
 
-      - name: 🔧 Install system dependencies
+      # ──────────────────────────────────────
+      # قدم سوم: نصب ابزارها و کتابخانه‌ها
+      # ──────────────────────────────────────
+      - name: 🔧 نصب ابزارهای ضروری
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl jq zip unzip openssl python3 python3-pip
+          sudo apt-get install -y zip unzip python3 python3-pip
 
-      - name: 🐍 Install Python dependencies
+      - name: 🐍 نصب کتابخانه‌های پایتون
         run: pip3 install requests
 
-      - name: 📝 Create downloader script (with resume support)
+      # ──────────────────────────────────────
+      # قدم چهارم: ساخت اسکریپت دانلودر
+      # ──────────────────────────────────────
+      - name: 📝 ساخت اسکریپت دانلودر
         run: |
           cat > telegram_downloader.py << 'EOF'
           #!/usr/bin/env python3
-          import requests
-          import sys
-          import time
+          import os, sys, time, json, uuid
           from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import requests
+          import re
+          import subprocess
 
-          def download_with_resume(url, output_path, headers, max_retries=10, chunk_size=64*1024):
-              output_path = Path(output_path)
-              output_path.parent.mkdir(parents=True, exist_ok=True)
-              temp_path = output_path.with_suffix(output_path.suffix + ".partial")
-              
-              downloaded = temp_path.stat().st_size if temp_path.exists() else 0
-              session = requests.Session()
-              session.headers.update(headers)
-              
+          def parse_links(raw_text):
+              text = raw_text.replace(',', '\n').replace(' ', '\n')
+              lines = text.splitlines()
+              links = []
+              for line in lines:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  if line.startswith('http'):
+                      links.append(line)
+                  else:
+                      if 't.me/' in line:
+                          links.append('https://' + line.lstrip('/'))
+              seen = set()
+              unique_links = []
+              for l in links:
+                  if l not in seen:
+                      seen.add(l)
+                      unique_links.append(l)
+              if len(unique_links) > 1000:
+                  print(f"⚠️ بیش از 1000 لینک تشخیص داده شد. فقط 1000 لینک اول پردازش می‌شود.")
+                  unique_links = unique_links[:1000]
+              print(f"✅ {len(unique_links)} لینک معتبر شناسایی شد.")
+              return unique_links
+
+          def download_with_resume(url, dest, headers, max_retries=10, chunk_size=64*1024):
+              dest = Path(dest)
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              temp = dest.with_name(f".{uuid.uuid4().hex}.partial")
+              downloaded = temp.stat().st_size if temp.exists() else 0
+              sess = requests.Session()
+              sess.headers.update(headers)
+
               for attempt in range(max_retries):
                   try:
                       range_header = {"Range": f"bytes={downloaded}-"} if downloaded > 0 else {}
-                      resp = session.get(url, stream=True, timeout=30, headers=range_header)
+                      resp = sess.get(url, stream=True, timeout=30, headers=range_header)
                       resp.raise_for_status()
-                      
-                      total_size = int(resp.headers.get('content-length', 0))
+                      total = int(resp.headers.get('content-length', 0))
                       if downloaded > 0:
-                          total_size = total_size + downloaded
-                      
+                          total += downloaded
                       mode = 'ab' if downloaded > 0 else 'wb'
-                      with open(temp_path, mode) as f:
+                      with open(temp, mode) as f:
                           for chunk in resp.iter_content(chunk_size=chunk_size):
                               if chunk:
                                   f.write(chunk)
                                   downloaded += len(chunk)
-                                  if total_size > 0:
-                                      percent = downloaded / total_size * 100
-                                      bar_len = 40
-                                      filled = int(bar_len * downloaded // total_size)
-                                      bar = '█' * filled + '░' * (bar_len - filled)
-                                      print(f"\rProgress: |{bar}| {percent:.1f}% ({downloaded}/{total_size} bytes)",
-                                            end='', flush=True)
+                                  if total > 0:
+                                      pct = downloaded / total * 100
+                                      bar = '█' * int(40 * downloaded // total) + '░' * (40 - int(40 * downloaded // total))
+                                      print(f"\rپیشرفت: |{bar}| {pct:.1f}% ({downloaded}/{total} بایت)", end='', flush=True)
                       print()
-                      temp_path.rename(output_path)
-                      return True
+                      temp.replace(dest)
+                      return True, dest.stat().st_size
                   except (requests.exceptions.ChunkedEncodingError,
                           requests.exceptions.ConnectionError,
                           requests.exceptions.Timeout) as e:
-                      print(f"\n⚠️ Connection lost: {e}. Retry {attempt+1}/{max_retries}")
+                      print(f"\n⚠️ قطع ارتباط: {e}. تلاش {attempt+1}/{max_retries}")
                       time.sleep(2 ** attempt)
                   except Exception as e:
-                      print(f"\n❌ Fatal error: {e}")
-                      return False
-              print("\n❌ Max retries reached.")
-              return False
+                      print(f"\n❌ خطای مرگبار: {e}")
+                      if temp.exists():
+                          temp.unlink()
+                      return False, 0
+              print("\n❌ تعداد تلاش‌ها به پایان رسید.")
+              if temp.exists():
+                  temp.unlink()
+              return False, 0
 
-          def download_telegram_file(telegram_link, output_dir="."):
-              api_url = "https://telegramdownloader.net/proxy.php"
-              headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+          def fetch_direct_link(telegram_link, headers):
+              api = "https://telegramdownloader.net/proxy.php"
               data = {"telegram_link": telegram_link}
-              
               try:
-                  print(f"🔗 Fetching download info...")
-                  resp = requests.post(api_url, headers=headers, data=data, timeout=15)
+                  resp = requests.post(api, headers=headers, data=data, timeout=15)
                   resp.raise_for_status()
                   result = resp.json()
                   raw_url = result.get('data', {}).get('data', {}).get('link')
                   file_name = result.get('data', {}).get('data', {}).get('file_name')
                   if not raw_url or not file_name:
-                      print("❌ Could not extract download link or filename")
-                      return False, "", 0
-                  
-                  out_path = Path(output_dir) / file_name
-                  print(f"📁 File: {file_name}")
-                  print(f"🚀 Starting download with resume support...")
-                  
-                  success = download_with_resume(raw_url, out_path, headers)
-                  if success:
-                      size = out_path.stat().st_size
-                      print(f"✅ Download complete: {file_name} ({size/1e6:.2f} MB)")
-                      return True, file_name, size
-                  return False, "", 0
+                      return None, None, "لینک مستقیم یافت نشد"
+                  return raw_url, file_name, None
               except Exception as e:
-                  print(f"❌ Error: {e}")
-                  return False, "", 0
+                  return None, None, str(e)
+
+          def sanitize_name(name):
+              if not name.isascii():
+                  rand = os.urandom(8).hex()
+                  ext = Path(name).suffix
+                  if not ext:
+                      ext = ".bin"
+                  return f"{rand}{ext}"
+              clean = re.sub(r'[^a-zA-Z0-9._-]', '_', name)
+              clean = re.sub(r'__+', '_', clean)
+              return clean
+
+          def process_one_link(link, base_dir, session_headers):
+              print(f"\n🔗 دریافت اطلاعات {link}")
+              url, fname, err = fetch_direct_link(link, session_headers)
+              if err:
+                  print(f"❌ خطا: {err}")
+                  return None, 0, err
+              print(f"📁 نام اصلی: {fname}")
+              dest = base_dir / fname
+              counter = 1
+              orig_stem = dest.stem
+              orig_suffix = dest.suffix
+              while dest.exists():
+                  dest = base_dir / f"{orig_stem}_{counter}{orig_suffix}"
+                  counter += 1
+              print(f"🚀 شروع دانلود...")
+              success, size = download_with_resume(url, dest, session_headers)
+              if not success:
+                  return None, 0, "دانلود ناموفق"
+              print(f"✅ دانلود کامل: {dest.name} ({size/1e6:.2f} MB)")
+              return dest, size, None
+
+          def main():
+              tel_links_env = os.environ.get("TEL_LINKS", "").strip()
+              if not tel_links_env:
+                  print("❌ هیچ لینکی وارد نشده.")
+                  sys.exit(1)
+              links = parse_links(tel_links_env)
+              if not links:
+                  print("❌ هیچ لینک معتبری یافت نشد.")
+                  sys.exit(1)
+
+              split_thresh_mb = int(os.environ.get("SPLIT_THRESH_MB", "0"))
+              subfolder = os.environ.get("SUBFOLDER", "").strip()
+              custom_filename = os.environ.get("CUSTOM_FILENAME", "").strip()
+
+              base = Path("downloads")
+              if subfolder:
+                  base = base / subfolder
+              base.mkdir(parents=True, exist_ok=True)
+
+              headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+              results = []
+              with ThreadPoolExecutor(max_workers=2) as executor:
+                  futures = {executor.submit(process_one_link, link, base, headers): link for link in links}
+                  for future in as_completed(futures):
+                      link = futures[future]
+                      try:
+                          dest, size, err = future.result()
+                          if err:
+                              print(f"🔴 لینک ناموفق: {link} ({err})")
+                          else:
+                              results.append((dest, size))
+                      except Exception as e:
+                          print(f"🔴 خطا در پردازش {link}: {e}")
+
+              if not results:
+                  print("❌ هیچ فایلی با موفقیت دانلود نشد.")
+                  sys.exit(1)
+
+              if custom_filename and len(results) == 1:
+                  dest, size = results[0]
+                  ext = dest.suffix
+                  if not Path(custom_filename).suffix and ext:
+                      new_name = custom_filename + ext
+                  else:
+                      new_name = custom_filename
+                  new_dest = dest.with_name(new_name)
+                  dest.rename(new_dest)
+                  print(f"✏️ نام فایل به {new_name} تغییر یافت.")
+                  results[0] = (new_dest, size)
+              elif custom_filename and len(results) > 1:
+                  print("⚠️ نام سفارشی تنها برای یک فایل اعمال می‌شود. درخواست نادیده گرفته شد.")
+
+              renamed = []
+              for dest, size in results:
+                  safe_name = sanitize_name(dest.name)
+                  if safe_name != dest.name:
+                      new_path = dest.with_name(safe_name)
+                      dest.rename(new_path)
+                      print(f"🌐 تغییر نام: {dest.name} -> {safe_name}")
+                      renamed.append((new_path, size))
+                  else:
+                      renamed.append((dest, size))
+
+              final_files = []
+              for fpath, size in renamed:
+                  if split_thresh_mb > 0 and size > split_thresh_mb * 1024 * 1024:
+                      print(f"✂️ در حال تقسیم فایل {fpath.name} (حجم: {size/1e6:.1f}MB)")
+                      zip_base = fpath.with_suffix(".zip")
+                      cmd = f"zip -s {split_thresh_mb}m \"{zip_base.name}\" -j \"{fpath.name}\""
+                      print(f"   اجرای: {cmd}")
+                      subprocess.run(cmd, shell=True, check=True, cwd=fpath.parent)
+                      fpath.unlink()
+                      parts = sorted(fpath.parent.glob(f"{zip_base.stem}.z*")) + [zip_base]
+                      for p in parts:
+                          final_files.append(p)
+                      print(f"   {len(parts)} بخش ساخته شد.")
+                  else:
+                      final_files.append(fpath)
+
+              info = [{"file": str(f.relative_to(Path("downloads"))), "size": f.stat().st_size} for f in final_files]
+              with open(base / ".download_results.json", "w") as f:
+                  json.dump(info, f, indent=2)
+
+              print("\n🎉 همه عملیات با موفقیت پایان یافت.")
+              print("فایل‌های نهایی:")
+              for f in final_files:
+                  print(f"   {f}")
 
           if __name__ == "__main__":
-              if len(sys.argv) < 2:
-                  print("Usage: python telegram_downloader.py <telegram_link> [output_dir]")
-                  sys.exit(1)
-              link = sys.argv[1]
-              out_dir = sys.argv[2] if len(sys.argv) > 2 else "."
-              success, fname, fsize = download_telegram_file(link, out_dir)
-              if success:
-                  with open(Path(out_dir) / ".download_info", "w") as info:
-                      info.write(f"{fname}\n{fsize}")
-              sys.exit(0 if success else 1)
+              main()
           EOF
           chmod +x telegram_downloader.py
 
-      - name: 📥 Download Telegram file
-        id: download
+      # ──────────────────────────────────────
+      # قدم پنجم: اجرای دانلودر
+      # ──────────────────────────────────────
+      - name: 🚀 اجرای دانلودر
         run: |
-          mkdir -p downloads
-          python3 telegram_downloader.py "${{ github.event.inputs.telegram_link }}" downloads
-          if [ -f downloads/.download_info ]; then
-            FILENAME=$(head -n1 downloads/.download_info)
-            FILESIZE=$(tail -n1 downloads/.download_info)
-            echo "downloaded_name=$FILENAME" >> $GITHUB_OUTPUT
-            echo "file_size=$FILESIZE" >> $GITHUB_OUTPUT
-            rm downloads/.download_info
-          else
-            echo "❌ Download failed"
-            exit 1
-          fi
+          export TEL_LINKS="${{ github.event.inputs.telegram_links }}"
+          export SPLIT_THRESH_MB="${{ github.event.inputs.split_threshold_mb }}"
+          export SUBFOLDER="${{ github.event.inputs.subfolder }}"
+          export CUSTOM_FILENAME="${{ github.event.inputs.custom_filename }}"
+          python3 telegram_downloader.py
 
-      - name: ✂️ Split large file (if needed)
-        if: github.event.inputs.split_threshold_mb != '0'
+      # ──────────────────────────────────────
+      # قدم ششم: ساخت/به‌روزرسانی Links.md
+      # ──────────────────────────────────────
+      - name: 📝 ساخت/به‌روزرسانی Links.md (بر اساس فایل‌های واقعی)
         run: |
-          THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
-          FILENAME="${{ steps.download.outputs.downloaded_name }}"
-          FILE_SIZE="${{ steps.download.outputs.file_size }}"
-          LIMIT=$((THRESHOLD * 1024 * 1024))
+          export REPO="${{ github.repository }}"
+          export BRANCH="${GITHUB_REF_NAME}"
+          export BASE_DIR="downloads"
 
-          if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$LIMIT" ]; then
-            echo "✂️ File (${FILE_SIZE} bytes) exceeds ${THRESHOLD}MB, splitting into parts..."
-            cd downloads
-            zip -s "${THRESHOLD}m" "${FILENAME}.zip" -j "$FILENAME"
-            rm "$FILENAME"
-            cd ..
-          else
-            echo "📦 File size within threshold, no splitting needed."
-          fi
+          python3 << 'PYEOF'
+          import os, urllib.parse
+          from pathlib import Path
+          from datetime import datetime, timezone, timedelta
 
-      - name: 🔄 Sanitize filenames (remove non‑ASCII / special characters)
-        run: |
-          cd downloads
-          for file in *; do
-            [ -e "$file" ] || continue
-            EXT="${file##*.}"
-            if [[ "$EXT" == "$file" ]]; then
-              EXT="bin"
-            fi
-            if [[ "$file" =~ [^[:ascii:]] ]]; then
-              RANDOM_NAME=$(openssl rand -hex 8)
-              NEW_NAME="${RANDOM_NAME}.${EXT}"
-              echo "   🌐 Renaming: $file -> $NEW_NAME"
-              mv "$file" "$NEW_NAME"
-            else
-              CLEAN_NAME=$(echo "$file" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
-              if [ "$file" != "$CLEAN_NAME" ]; then
-                echo "   📝 Cleaning: $file -> $CLEAN_NAME"
-                mv "$file" "$CLEAN_NAME"
-              fi
-            fi
-          done
-          cd ..
+          repo = os.environ["REPO"]
+          branch = os.environ["BRANCH"]
+          base_dir = Path(os.environ["BASE_DIR"])
 
-      - name: 📤 Upload files to GitHub (one by one)
+          all_files = []
+          for f in base_dir.rglob("*"):
+              if f.is_file() and not f.name.startswith(".") and f.suffix != ".json":
+                  all_files.append(f)
+
+          if not all_files:
+              header = "## 🔗 Direct Download Links\n> Click on any link below to start downloading directly.<br><br/>\n\n"
+              with open("Links.md", "w") as f:
+                  f.write(header)
+              print("📂 پوشهٔ downloads خالی است. Links.md بازنویسی شد.")
+              exit(0)
+
+          lines = []
+          ir_tz = timezone(timedelta(hours=3, minutes=30))
+          now = datetime.now(timezone.utc).astimezone(ir_tz).strftime("%Y-%m-%d %H:%M IR")
+          lines.append(f"### 📅 {now}")
+
+          for fpath in sorted(all_files):
+              rel_path = fpath.relative_to(base_dir)
+              encoded_path = "/".join(urllib.parse.quote(p, safe='') for p in rel_path.parts)
+              raw_url = f"https://github.com/{repo}/raw/{branch}/downloads/{encoded_path}"
+              
+              size = fpath.stat().st_size
+              if size >= 1048576:
+                  size_str = f"{size/1048576:.1f}MB"
+              elif size >= 1024:
+                  size_str = f"{size//1024}KB"
+              else:
+                  size_str = f"{size}B"
+              
+              ext = fpath.suffix[1:] if fpath.suffix else ""
+              icon = "📥"
+              if ext == "apk": icon = "📱"
+              elif ext in ("mp4", "mkv", "avi", "mov"): icon = "🎬"
+              elif ext in ("mp3", "m4a", "flac", "ogg"): icon = "🎵"
+              elif ext == "zip" or ext.startswith("z"): icon = "🗜️"
+              
+              lines.append(f"- {icon} [{fpath.name}]({raw_url}) `{size_str}`")
+          
+          content = "\n".join(lines) + "\n\n---\n\n"
+          header = "## 🔗 Direct Download Links\n> Click on any link below to start downloading directly.<br><br/>\n\n"
+          
+          with open("Links.md", "w") as f:
+              f.write(header)
+              f.write(content)
+
+          print(f"✅ Links.md با {len(all_files)} فایل به‌روزرسانی شد.")
+          PYEOF
+
+      # ──────────────────────────────────────
+      # قدم هفتم: ارسال فایل‌ها به مخزن (دسته‌بندی حجم‌محور هوشمند)
+      # ──────────────────────────────────────
+      - name: 📤 ارسال فایل‌های جدید به مخزن (دسته‌بندی بر اساس حجم)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           if [ ! -d "downloads" ] || [ -z "$(ls -A downloads 2>/dev/null)" ]; then
-            echo "⚠️ No files to upload!"
+            echo "⚠️ هیچ فایلی برای بارگذاری وجود ندارد!"
             exit 1
           fi
 
-          NEW_FILES=()
-          for file in downloads/*; do
-            filename=$(basename "$file")
-            if ! git ls-files --error-unmatch "downloads/$filename" &>/dev/null; then
-              NEW_FILES+=("$filename")
-            else
-              echo "⏭️ Skipping already tracked file: $filename"
-            fi
-          done
-
-          TOTAL=${#NEW_FILES[@]}
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "✅ No new files to upload!"
-            exit 0
+          # جمع‌آوری فایل‌های جدید (بدون فایل‌های موقت)
+          mapfile -t NEW_FILES < <(find downloads -type f ! -name "*.partial" ! -name ".download_results.json")
+          if [ -f Links.md ] && ! git diff --quiet Links.md; then
+            NEW_FILES+=("Links.md")
           fi
 
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "📦 New files to upload: $TOTAL"
-          echo "═══════════════════════════════════════════════════════════════"
+          TOTAL_FILES=${#NEW_FILES[@]}
+          if [ $TOTAL_FILES -eq 0 ]; then
+            echo "✅ فایل جدیدی برای commit وجود ندارد."
+            exit 0
+          fi
+          echo "🔢 تعداد فایل‌های جدید: $TOTAL_FILES"
 
-          for (( i=0; i<TOTAL; i++ )); do
-            echo ""
-            echo "🚀 Uploading $((i+1)) of $TOTAL: ${NEW_FILES[$i]}"
-            git add "downloads/${NEW_FILES[$i]}"
-            git commit -m "Add ${NEW_FILES[$i]} [skip ci]"
+          MAX_BATCH_SIZE_MB=100   # حداکثر حجم هر دسته به مگابایت
+          batch=()
+          batch_size_mb=0
 
+          for file in "${NEW_FILES[@]}"; do
+            file_size_mb=$(( $(stat -c%s "$file") / 1048576 ))
+            if [ $((batch_size_mb + file_size_mb)) -gt $MAX_BATCH_SIZE_MB ] && [ ${#batch[@]} -gt 0 ]; then
+              echo "📦 ارسال دسته با حجم تقریبی ${batch_size_mb}MB (${#batch[@]} فایل)"
+              git add "${batch[@]}"
+              git commit -m "Add files batch [skip ci]" || echo "Nothing to commit?"
+              for attempt in 1 2 3; do
+                if git push origin ${{ github.ref_name }} 2>&1; then
+                  echo "   ✅ دسته با موفقیت push شد"
+                  break
+                else
+                  if [ $attempt -lt 3 ]; then
+                    echo "   ⚠️ تلاش $attempt/3 ناموفق، ۱۰ ثانیه صبر می‌کنیم..."
+                    sleep 10
+                  else
+                    echo "   ❌ push پس از ۳ تلاش ناموفق ماند"
+                    exit 1
+                  fi
+                fi
+              done
+              batch=()
+              batch_size_mb=0
+            fi
+            batch+=("$file")
+            batch_size_mb=$((batch_size_mb + file_size_mb))
+          done
+
+          if [ ${#batch[@]} -gt 0 ]; then
+            echo "📦 ارسال آخرین دسته با حجم تقریبی ${batch_size_mb}MB (${#batch[@]} فایل)"
+            git add "${batch[@]}"
+            git commit -m "Add final files batch [skip ci]" || echo "Nothing to commit?"
             for attempt in 1 2 3; do
-              if git push origin main 2>&1; then
-                echo "   ✅ Uploaded successfully"
+              if git push origin ${{ github.ref_name }} 2>&1; then
+                echo "   ✅ آخرین دسته push شد"
                 break
               else
                 if [ $attempt -lt 3 ]; then
-                  echo "   ⚠️ Push failed, retry $attempt/3..."
-                  git reset --soft HEAD~1
-                  sleep 5
+                  echo "   ⚠️ تلاش $attempt/3 ناموفق، ۱۰ ثانیه صبر می‌کنیم..."
+                  sleep 10
                 else
-                  echo "   ❌ Failed to upload ${NEW_FILES[$i]}"
-                  git reset --soft HEAD~1
+                  echo "   ❌ push آخرین دسته شکست خورد"
+                  exit 1
                 fi
               fi
             done
-          done
+          fi
+
+          echo "🎉 تمام فایل‌ها با موفقیت ارسال شدند."
